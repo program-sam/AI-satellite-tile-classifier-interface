@@ -1,0 +1,407 @@
+<html>
+
+<head>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css"
+        integrity="sha512-xodZBNTC5n17Xt2atTPuE1HxjVMSvLVW9ocqUKLsCC5CXdbqCmblAshOMAS6/keqq/sMZMZ19scR4PsZChSR7A=="
+        crossorigin="" />
+    <style>
+        body {
+            font-family: monospace
+        }
+
+        .preview {
+            width: 250px;
+            height: 250px;
+        }
+
+        .preview:hover {
+            cursor: pointer;
+            opacity: 0.8;
+        }
+
+        table {
+            width: 100%;
+            text-align: center;
+            vertical-align: middle;
+        }
+
+        td {
+            padding: 20px;
+            width: 50%;
+        }
+    </style>
+</head>
+
+<body>
+    <table>
+        <tr>
+            <td>
+                <span>
+                    JSON: <input type="file" id="upload-json"
+                        onchange="document.getElementById('initbtn').disabled=false" /><br>
+                    Weights: <input type="file" id="upload-weights"
+                        onchange="document.getElementById('initbtn').disabled=false" /><br><br>
+                    min zoom: <input type="range" min=1 max=20 value=6 id="min-zoom"
+                        oninput="this.nextElementSibling.value = this.value; document.getElementById('initbtn').disabled=false" /><output>6</output><br>
+                    max zoom: <input type="range" min=1 max=20 value=10 id="max-zoom"
+                        oninput="this.nextElementSibling.value = this.value; document.getElementById('initbtn').disabled=false" /><output>10</output><br><br>
+                    batch size: <input type='number' min=10 max=1000 value=50 id="batch-size" />
+
+                    <div><br>
+                        Top Left Bound: <input id='TL_lat' type='number' value=85 style="width: 50px;">(lat)&nbsp;
+                        <input id='TL_lng' type='number' value=-180 style="width: 50px;"
+                            onchange="document.getElementById('initbtn').disabled=false">(lng)<br>
+                        Bottom Right Bound: <input id='BR_lat' type='number' value=-85 style="width: 50px;">(lat)&nbsp;
+                        <input id='BR_lng' type='number' value=180 style="width: 50px;"
+                            onchange="document.getElementById('initbtn').disabled=true">(lng)<br>
+                    </div><br>
+                    <button onclick='initIterator()' id='initbtn'>Init</button>
+                    <button
+                        onclick='runBatch(); STOPPED=false; document.getElementById("stopbtn").disabled=false; this.disabled=true'
+                        id='nxtbtn'>Next</button>
+                    <button
+                        onclick='STOPPED = true; document.getElementById("nxtbtn").disabled=false; this.disabled=true'
+                        id='stopbtn' disabled>Stop</button>
+                </span>
+            </td>
+            <td>
+                <span>
+                    <h1 id='counter'>0</h1> scanned tiles <p style="display: inline-block; margin: 0;" id='datacount'>
+                    </p>
+                </span>
+            </td>
+        </tr>
+    </table>
+    <div id='map' style="height: 600px;"></div>
+    <hr>
+</body>
+
+<script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"
+    integrity="sha512-XQoYMqMTK8LvdxXYG3nZ448hOEQiglfqkJs1NOQV44cWnUrBc8PkAOcXy20w0vlaXaVUearIOBhiXZ5V3ynxwA=="
+    crossorigin=""></script>
+<script src="./countries.js"></script>
+<script src="https://unpkg.com/@mapbox/leaflet-pip@latest/leaflet-pip.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet-editable/1.2.0/Leaflet.Editable.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@2.0.0/dist/tf.min.js"></script>
+<script>
+
+    //////////////////////////
+    // Set Global Variables //
+    //////////////////////////
+
+    let PAUSED = true
+    let STOPPED = false
+    let tileCount = 0
+    let dataCount = 0
+
+    let iterator // Constructor to yield image predictions. initialized in the initIterator function
+
+    let latBounds = [document.getElementById('TL_lat').value, document.getElementById('BR_lat').value]
+    let lngBounds = [document.getElementById('TL_lng').value, document.getElementById('BR_lng').value]
+
+    // Depends on tile layer, these are the standard values (range of the web Mercator projection)
+    const xRange = 20037508.3427892439067364
+    const yRange = 20037508.3427892439067364
+
+
+    //////////////////////////////////////////////////
+    // Add the map with a basemap and draw controls //
+    //////////////////////////////////////////////////
+
+    const map = L.map('map', { editable: true }).setView([10, 20], 3);
+    const boundsLayer = L.layerGroup() // This layer stores the determined search area
+
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}.jpg', {
+        attribution: '&copy; Image data from <a href="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery">ESRI</a>',
+        noWrap: true
+    }).addTo(map);
+
+    // Enable draw controls
+    L.EditControl = L.Control.extend({
+        options: {
+            position: 'topleft',
+            callback: null,
+            kind: '',
+            html: ''
+        },
+        onAdd: function (map) {
+            var container = L.DomUtil.create('div', 'leaflet-control leaflet-bar'),
+                link = L.DomUtil.create('a', '', container);
+
+            link.href = '#';
+            link.title = 'Draw bounds'
+            link.innerHTML = this.options.html;
+            L.DomEvent.on(link, 'click', L.DomEvent.stop)
+                .on(link, 'click', function () {
+                    window.LAYER = this.options.callback.call(map.editTools);
+                }, this)
+            return container;
+        }
+    });
+
+    // Add a button to draw a rectangle
+    L.NewRectangleControl = L.EditControl.extend({
+        options: {
+            position: 'topleft',
+            callback: map.editTools.startRectangle,
+            kind: 'rectangle',
+            html: '&#9724;'
+        }
+    });
+
+    // Add drawcontrol to map
+    map.addControl(new L.NewRectangleControl())
+
+    // When the end of a drawing triggers the event, update the search area.
+    map.on('editable:vertex:dragend', ({ layer }) => {
+        boundsLayer.eachLayer((ly) => { if (ly != layer) { ly.remove() } });
+        layer.setStyle({ fillOpacity: 0, color: '#f7a828' })
+        boundsLayer.addLayer(layer)
+        document.getElementById('TL_lat').value = layer.getBounds().getNorthWest().lat.toFixed(2)
+        document.getElementById('TL_lng').value = layer.getBounds().getNorthWest().lng.toFixed(2)
+        document.getElementById('BR_lat').value = layer.getBounds().getSouthEast().lat.toFixed(2)
+        document.getElementById('BR_lng').value = layer.getBounds().getSouthEast().lng.toFixed(2)
+        document.getElementById('initbtn').disabled = false
+    })
+
+    // Load country data to check if a tile is land / water
+    const countriesLayer = new L.geoJson(countries)
+
+    ///////////////////////
+    // Declare Functions //
+    ///////////////////////
+
+    function formatBytes(bytes, decimals = 2) {
+        // kindly borrowed from https://stackoverflow.com/questions/15900485/correct-way-to-convert-size-in-bytes-to-kb-mb-gb-in-javascript
+        if (bytes === 0) return '0 Bytes';
+        const k = 1024;
+        const dm = decimals < 0 ? 0 : decimals;
+        const sizes = ['Bytes', 'Kb', 'Mb', 'Gb'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+    }
+
+    function addButton(z, latlng, canvas) {
+        // Adds a tile to the bottom of the page, requires zoom level, coordinates, and an image to display as preview
+        const span = document.createElement('span')
+        canvas.className = 'preview'
+        span.appendChild(canvas)
+        span.onclick = () => {
+            map.setView(latlng, z + 1) // Zoom to one level higher so you properly see the tile
+            window.scrollTo(0, 0);
+        }
+        document.body.appendChild(span)
+    }
+
+    function addCounter() {
+        // adds one to the image counter0
+        tileCount += 1
+        document.getElementById('counter').innerHTML = tileCount
+        document.getElementById('datacount').innerHTML = `(${formatBytes(dataCount)})`
+    }
+
+    function check(model, z, x, y, latlng) {
+        // Takes as input: a set of coordinates and a TensorFlow model. returns a response (water tile, low/high prediction score...)
+        return new Promise((resolve, reject) => {
+
+            // Initial check if the point is in the sea or not
+            if (leafletPip.pointInLayer([latlng.lng, latlng.lat], countriesLayer).length == 0) { resolve(['not on land']); return }
+
+            let img = new Image()
+            img.crossOrigin = "Anonymous"; // Helps with potential CORS issues
+            img.onload = async () => {
+                addCounter()
+                // Create canvas to store and read image pixels
+                var canvas = document.createElement('canvas');
+                // Dimensions determined by the TensorFlow model (70x70)
+                canvas.width = 70;
+                canvas.height = 70;
+                canvas.getContext('2d').drawImage(img, 0, 0, 70, 70);
+                const imageData = canvas.getContext('2d').getImageData(0, 0, 70, 70)
+                const predictData = []
+
+                // Target shape (70 x 70 x 1 pixels) as determined by the model:
+                // [
+                //     [
+                //         [[.1], [.2], ..., [.3]],
+                //         [[.4], [.5], ..., [.6]],
+                //          ...
+                //         [[.7], [.8], ..., [.9]]
+                //     ],
+                //     [
+                //         [[.1], [.2], ..., [.3]],
+                //         [[.4], [.5], ..., [.6]],
+                //          ...
+                //         [[.7], [.8], ..., [.9]]
+                //     ]
+
+                // ]
+
+                for (i = 0; i < imageData.data.length; i += 4) {
+                    const red = imageData.data[i];
+                    const green = imageData.data[i + 1];
+                    const blue = imageData.data[i + 2];
+
+                    const grey = (red + green + blue) / 3
+
+                    imageData.data[i] = grey
+                    imageData.data[i + 1] = grey
+                    imageData.data[i + 2] = grey
+                    imageData.data[i + 3] = 255 //alpha
+
+                    predictData.push([grey / 255])
+                }
+
+                // Reshape array
+                const predictImage = [];
+                while (predictData.length) predictImage.push(predictData.splice(0, 70));
+
+                // Do the prediction
+                const example = await tf.tensor([predictImage])
+                let pred = await model.predict(example)
+                pred = await pred.array()
+
+                if (pred[0][0] > 0.95) {
+                    // the model has dificulties with coastlines, they are often wrongly classified. Except at zoom levels above 6
+                    // At these zoom levels there are still some fun results.
+                    // Validate if corners are within a country
+                    // This is computationally expensive, so only do the check for every corner on a positive classification
+                    const xMax = Math.pow(2, z)
+                    const yMax = Math.pow(2, z)
+
+                    const x1 = -xRange + (x / xMax) * (xRange + xRange)
+                    const y1 = yRange - (y / yMax) * (yRange + yRange)
+                    const x2 = -xRange + ((x + 1) / xMax) * (xRange + xRange)
+                    const y2 = yRange - ((y + 1) / yMax) * (yRange + yRange)
+
+                    const pointTL = new L.Point(x1, y1)
+                    const pointBL = new L.Point(x1, y2)
+                    const pointTR = new L.Point(x2, y1)
+                    const pointBR = new L.Point(x2, y2)
+
+                    const latlngTL = L.Projection.SphericalMercator.unproject(pointTL);
+                    const latlngBL = L.Projection.SphericalMercator.unproject(pointBL);
+                    const latlngTR = L.Projection.SphericalMercator.unproject(pointTR);
+                    const latlngBR = L.Projection.SphericalMercator.unproject(pointBR);
+
+                    // Abandon positives when not all corners are on land to avoid these coastlines
+                    if (z > 6) {
+                        if (leafletPip.pointInLayer([latlngTL.lng, latlngTL.lat], countriesLayer).length == 0) { resolve(['coastline']); return }
+                        else if (leafletPip.pointInLayer([latlngBL.lng, latlngBL.lat], countriesLayer).length == 0) { resolve(['coastline']); return }
+                        else if (leafletPip.pointInLayer([latlngTR.lng, latlngTR.lat], countriesLayer).length == 0) { resolve(['coastline']); return }
+                        else if (leafletPip.pointInLayer([latlngBR.lng, latlngBR.lat], countriesLayer).length == 0) { resolve(['coastline']); return }
+                    }
+
+                    canvas.getContext('2d').putImageData(imageData, 0, 0);
+                    resolve([z, x, y, latlng, canvas, pred])
+                    addButton(z, latlng, canvas)
+                } else {
+                    resolve(['small pred value'])
+                }
+            }
+            img.onerror = (errorMsg, url, lineNumber, column, errorObj) => {
+                console.log(errorMsg);
+                console.log(url);
+                resolve(['error'])
+            }
+            fetch(`https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}.jpg`)
+                .then(response => response.blob())
+                .then(blob => {
+                    dataCount += blob.size
+                    img.src = URL.createObjectURL(blob);
+                })
+        })
+    }
+
+    function* startSearch(model, minZoom, maxZoom) {
+        // The iterator that yields the check promises
+        // Yield has the benefit of controlling the loop, pausing and continuing when desired
+        for (var z = parseInt(minZoom); z <= parseInt(maxZoom); z++) {
+            const xMax = Math.pow(2, z)
+            const yMax = Math.pow(2, z)
+            for (let x = 0; x < xMax; x++) {
+                for (let y = 0; y < yMax; y++) {
+                    const x1 = -xRange + (x / xMax) * (xRange + xRange)
+                    const y1 = yRange - (y / yMax) * (yRange + yRange)
+                    const x2 = -xRange + ((x + 1) / xMax) * (xRange + xRange)
+                    const y2 = yRange - ((y + 1) / yMax) * (yRange + yRange)
+
+                    // get center of tile
+                    const xp = (x1 + x2) / 2
+                    const yp = (y1 + y2) / 2
+
+                    const point = new L.Point(xp, yp)
+                    const latlng = L.Projection.SphericalMercator.unproject(point);
+
+                    if (latlng.lat > latBounds[0] ||
+                        latlng.lat < latBounds[1] ||
+                        latlng.lng < lngBounds[0] ||
+                        latlng.lng > lngBounds[1]) { continue }
+
+                    yield check(model, z, x, y, latlng)
+                }
+            }
+        }
+    }
+
+    async function initIterator() {
+        // Initializes the iterator and sets global variables (init/reset)
+        const uploadJSONInput = document.getElementById('upload-json');
+        const uploadWeightsInput = document.getElementById('upload-weights');
+        const model = await tf.loadLayersModel(tf.io.browserFiles([uploadJSONInput.files[0], uploadWeightsInput.files[0]]));
+        console.log('tf model loaded')
+
+        const minZoom = document.getElementById('min-zoom').value
+        const maxZoom = document.getElementById('max-zoom').value
+
+        iterator = startSearch(model, minZoom, maxZoom)
+        document.getElementById('initbtn').disabled = true
+        console.log('initialized')
+    }
+
+    function runBatch() {
+        // Runs check promises simultaniously according to batch size
+        const count = document.getElementById('batch-size').value
+        latBounds = [document.getElementById('TL_lat').value, document.getElementById('BR_lat').value]
+        lngBounds = [document.getElementById('TL_lng').value, document.getElementById('BR_lng').value]
+
+        const promises = []
+        for (let i = 0; i < count; i++) {
+            promises.push(iterator.next().value)
+        }
+        Promise.all(promises)
+            .then(res => {
+                let foundSmth = false
+                for (let i = 0; i < res.length; i++) {
+                    if (res[i].length > 1) {
+                        foundSmth = true
+                        const z = res[i][0]
+                        const x = res[i][1]
+                        const y = res[i][2]
+                        const latlng = res[i][3]
+
+                        const xMax = Math.pow(2, z)
+                        const yMax = Math.pow(2, z)
+
+                        const x1 = -xRange + (x / xMax) * (xRange + xRange)
+                        const y1 = yRange - (y / yMax) * (yRange + yRange)
+                        const x2 = -xRange + ((x + 1) / xMax) * (xRange + xRange)
+                        const y2 = yRange - ((y + 1) / yMax) * (yRange + yRange)
+
+                        const latlng1 = L.Projection.SphericalMercator.unproject(new L.Point(x1, y1));
+                        const latlng2 = L.Projection.SphericalMercator.unproject(new L.Point(x2, y2));
+                        const bounds = L.latLngBounds(latlng1, latlng2)
+                        L.rectangle(bounds).addTo(map)
+
+                        map.setView(latlng, z + 1)
+                    }
+                }
+                if (!STOPPED) {
+                    runBatch(count)
+                }
+            })
+    }
+
+</script>
+
+</html>
